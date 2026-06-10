@@ -45,19 +45,31 @@ GitLab's **REST API rejects Basic** — but GitLab's **git-over-HTTPS** endpoint
 **accepts a GitLab token as the Basic password** (that's how
 `git clone https://user:TOKEN@gitlab/...` works, with any non-empty username).
 
-So nginx forwards the client's `Authorization` header **unchanged** to a git
-endpoint and lets GitLab decide:
+So nginx forwards the client's `Authorization` header **unchanged** to the git
+endpoint of **one specific project** and lets GitLab decide. Access to the
+private cache is therefore exactly *"can read that GitLab project"*:
 
 ```
-auth_request -> GET https://gitlab.example.com/grp/nix-cache-acl.git/info/refs?service=git-upload-pack
-   200       -> valid token with read access  -> serve
-   401 / 403 -> missing / invalid / no access -> deny
+auth_request -> GET https://gitlab.example.com/your-group/your-project.git/info/refs?service=git-upload-pack
+   200      -> token may read your-group/your-project -> serve
+   anything -> missing / invalid / no access          -> deny (fail closed)
 ```
 
-No proxy, no JavaScript, no Lua, no base64 decoding. The chosen repo
-(`grp/nix-cache-acl`) **is the ACL**: grant it `read_repository` access to
-whoever may read the private cache. Personal, project, and group access
-tokens all work; so does `$CI_JOB_TOKEN` (use `login gitlab-ci-token`).
+No proxy, no JavaScript, no Lua, no base64 decoding. The gating project **is
+the ACL**: grant it read access to whoever may use the private cache. Personal,
+project, and group access tokens all work; so does `$CI_JOB_TOKEN` (use
+`login gitlab-ci-token`).
+
+Two requirements for this to gate correctly:
+
+- **The gating project must be PRIVATE or INTERNAL.** A *public* project's git
+  endpoint returns `200` with no auth, which would open the cache to everyone.
+- **The token needs git read access** (Reporter role or higher /
+  `read_repository` scope). Guest membership is not enough to clone, so Guests
+  are denied.
+
+Denials fail closed: nginx maps any non-200 from GitLab (including `404` or
+GitLab being unreachable) to a clean `403`/`401` rather than serving the file.
 
 ## The one push command
 
@@ -126,6 +138,10 @@ Verified locally with real `nix` + `nginx` (stock build, no modules):
 - **A real `nix` pull with netrc** succeeds with a valid token and is denied
   with an invalid one — the Basic header is forwarded as-is to a (mock) git
   `info/refs` endpoint that returns 200/401, gating both narinfo and nar.
+- **Project-access gating fails closed**: a token *with* access → 200/serve; a
+  valid token *without* access to the gating project (mock 404) → clean 403;
+  invalid token / no credential → 401. Verified against a mock returning
+  different codes per credential.
 - the auth-verdict cache collapses a multi-object pull into a couple of
   upstream calls; empty-credential requests are rejected without calling GitLab.
 

@@ -6,7 +6,7 @@
 #   login    : any non-empty string (GitLab ignores it for access tokens).
 #              For a CI job token use   login gitlab-ci-token
 #   password : a GitLab personal/project/group access token (scope:
-#              read_repository) that has read access to grp/nix-cache-acl,
+#              read_repository) that has read access to your-group/your-project,
 #              or $CI_JOB_TOKEN.
 machine cache-internal.example.com
   login nixcache
