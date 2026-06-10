@@ -1,0 +1,13 @@
+# /etc/nix/netrc  (mode 600). How vanilla `nix` authenticates to the private
+# cache: it sends "Authorization: Basic base64(login:password)", and the
+# server forwards that to GitLab's git endpoint, which accepts the GitLab
+# token as the password.
+#
+#   login    : any non-empty string (GitLab ignores it for access tokens).
+#              For a CI job token use   login gitlab-ci-token
+#   password : a GitLab personal/project/group access token (scope:
+#              read_repository) that has read access to grp/nix-cache-acl,
+#              or $CI_JOB_TOKEN.
+machine cache-internal.example.com
+  login nixcache
+  password glpat-REPLACE_WITH_YOUR_TOKEN
