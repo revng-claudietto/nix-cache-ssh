@@ -1,117 +1,90 @@
 #!/usr/bin/env bash
 #
-# Incrementally push the closure of one or more packages to a *remote* `file://`
-# Nix binary cache reachable over rsync, copying only the paths that need to be
-# synced and omitting any package already served by `https://cache.nixos.org`.
-#
-# How it works (and why it is safe):
-#
-#   A `file://` binary cache considers a store path "already present" purely by
-#   the existence of its `<hash>.narinfo` file -- it never checks whether the
-#   referenced `nar/<filehash>.nar` actually exists
-#   (libstore: BinaryCacheStore::isValidPathUncached -> fileExists(narinfo)).
-#
-#   So we:
-#     1. make a temp dir,
-#     2. rsync ONLY the `*.narinfo` files (+ nix-cache-info) down into it
-#        -- cheap; the multi-GB `nar/` blobs stay on the remote,
-#     3. list the closure with `nix path-info`, then fetch from cache.nixos.org
-#        the narinfo of every closure path it serves (fetch-narinfos.py): those
-#        get seeded into file://$tmp so the cache's reference check passes, and
-#        the paths it could NOT fetch are the ones we must copy ourselves,
-#     4. `nix copy --no-recursive` those paths into file://$tmp (signing them,
-#        and skipping any already on the remote), then delete every narinfo that
-#        was already present before the copy (the seeded + pulled ones),
-#     5. rsync only the new files back up.
-#
-# The push is done in two passes (nars first, narinfos last) -- mirroring nix's
-# own write ordering -- so that an interruption can only ever leave a nar
-# without a narinfo (harmless: looks invalid, re-uploaded next run), never a
-# narinfo without its nar (which would mask a missing blob forever).
+# Given a rsync remote and a list of nix package(s), push the incremental set of
+# derivations to the remote as a binary cache. This is done with the following
+# steps:
+# 1. Generate the transitive closure of all the derivations from the specified
+#    package(s) and compute the store path for each
+# 2. From the remote, copy all the `*.narinfo` files into a scratch directory
+# 3. For each store path, try and fetch the `.narinfo` from
+#    `https://cache.nixos.org` into the scratch directory as well
+# 4. Run the actual `nix copy` command, since the target directory already
+#    contains a bunch of `.narinfo`s, all of these will be skipped and their
+#    derivation's `.nar` archive will not be generated
+# 5. Delete all the `.narinfo`s generated from step (2) and (3)
+# 6. rsync the scratch directory to the remote
 #
 # Usage:
-#   incremental-cache-push.sh <rsync-target> <package> [<package>...]
+#   copy.sh <rsync-target> <package> [<package>...]
 #
-#   <rsync-target>  Destination cache root as rsync understands it, e.g.
-#                     user@host:/srv/nix-cache
-#                     rsync://host/cache
-#                     /mnt/nfs/nix-cache            (local path)
-#   <package>       One or more packages / flake refs, e.g. `nixpkgs#openssl`.
-#                   Each is realised to its output store path(s) and pushed
-#                   together with its runtime closure.
+#   <rsync-target>  any rsync-compatible destination
+#   <package>       One or more packages / flake refs, e.g. `nixpkgs#openssl`
 #
 # Environment variables:
-#   SECRET_KEY_FILE   REQUIRED. Secret key used to sign the narinfos of newly
-#                     copied paths (passed as the cache's `secret-key`
-#                     parameter). Already-present paths are not re-signed, so if
-#                     nothing new is copied, nothing is signed.
+#   SECRET_KEY_FILE   REQUIRED. This is the secret key that will be used for
+#                     signing the new `.narinfo`s before uploading them to the
+#                     remote.
+
 set -euo pipefail
-shopt -s nullglob
 
-# The signing key is required: every published narinfo is signed with it.
-: "${SECRET_KEY_FILE:?SECRET_KEY_FILE must be set to the secret signing key}"
-
-# Arguments
-remote="${1%/}"          # strip a single trailing slash for consistent rsync semantics
-shift
-packages=("$@")          # inputs are package / flake refs, e.g. nixpkgs#openssl
+SCRIPT_DIR=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
 
 function nix_cmd() {
     nix --extra-experimental-features "nix-command flakes" "$@"
 }
 
-# Directory holding this script (and fetch-narinfos.py), resolving any symlink.
-script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Argument parsing
+REMOTE="${1%/}"
+shift
+PACKAGES=("$@")
 
-tmp="$(mktemp --tmpdir -d tmp.nix-cache-push.XXXXXXXXXX)"
-closure_file="$(mktemp --tmpdir tmp.nix-cache-push.closure.XXXXXXXXXX)"
-tocopy_file="$(mktemp --tmpdir tmp.nix-cache-push.tocopy.XXXXXXXXXX)"
+# Temporary files
+SCRATCH_DIR="$(mktemp --tmpdir -d tmp.nix-cache-push.XXXXXXXXXX)"
+CLOSURE_FILE="$(mktemp --tmpdir tmp.nix-cache-push.closure.XXXXXXXXXX)"
+MISSING_CLOSURES="$(mktemp --tmpdir tmp.nix-cache-push.tocopy.XXXXXXXXXX)"
 cleanup() {
-  rm -rf "$tmp" "$closure_file" "$tocopy_file"
+  rm -rf "$SCRATCH_DIR" "$CLOSURE_FILE" "$MISSING_CLOSURES"
 }
 trap cleanup EXIT
 
-# Resolve packages to their output store paths, then compute the full closure
-# -- the set of store paths that might need to be pushed.
-output_paths=()
+# Given a list of desired packages, resolve them to the one or more store paths
+# in the local system
 readarray -t output_paths < <(
-  for package in "${packages[@]}"; do
-    nix_cmd build --no-link --print-out-paths "$package"
+  for PACKAGE in "${PACKAGES[@]}"; do
+    nix_cmd build --no-link --print-out-paths "$PACKAGE"
   done
 )
-nix_cmd path-info --recursive "${output_paths[@]}" > "$closure_file"
+nix_cmd path-info --recursive "${output_paths[@]}" > "$CLOSURE_FILE"
 
 # Pull narinfos from the remote, so paths it already has are skipped below.
-rsync -a --include='/nix-cache-info' --include='/*.narinfo' --exclude='*' \
-    "$remote/" "$tmp/"
+rsync \
+  -a --include='/nix-cache-info' --include='/*.narinfo' --exclude='*' \
+  "$REMOTE/" "$SCRATCH_DIR/"
 
-# (1) Fetch the narinfos cache.nixos.org serves for the closure straight into
-#     $tmp (narinfos only, no nars). Seeding them lets the binary cache's
-#     reference-validity check pass for the paths we copy that depend on them.
-#     nix-shell does not forward our stdin, so the path list is passed as a file;
-#     fetch-narinfos.py prints to stdout the paths it could NOT fetch -- the ones
-#     not on cache.nixos.org, which we must copy ourselves.
+# Run the `fetch-narinfos.py` script, which will fetch all the `.narinfos`
+# it can from cache.nixos.org. The ones that cannot be fetched are printed to
+# stdout.
 nix-shell -p "python3.withPackages(ps: [ ps.niquests ])" \
-    --run "python3 '$script_dir/fetch-narinfos.py' '$tmp' '$closure_file'" \
-    > "$tocopy_file"
-mapfile -t store_paths < "$tocopy_file"
+    --run "'$SCRIPT_DIR/fetch-narinfos.py' '$SCRATCH_DIR' '$CLOSURE_FILE'" \
+    > "$MISSING_CLOSURES"
+readarray -t store_paths < "$MISSING_CLOSURES"
 
-# Snapshot the narinfos present before the copy (pulled from the remote +
-# fetched from cache.nixos.org). Only the narinfos the copy adds should be
-# pushed, so we delete these afterwards.
-existing_narinfos=("$tmp"/*.narinfo)
+# Save which narinfos are present, these will be deleted before the scratch
+# directory is re-pushed back to the remote
+existing_narinfos=("$SCRATCH_DIR"/*.narinfo)
 
-# (2) Create new narinfos and nars for the paths we publish. A single batched
-#     copy lets nix topologically sort them, so a kept path is never written
-#     before a kept dependency it references.
+# Actually perform the copy of the store paths. All the packages for which the
+# `.narinfo` is already present will be skipped.
 if [[ ${#store_paths[@]} -gt 0 ]]; then
-    nix_cmd copy --to "file://$tmp?secret-key=$SECRET_KEY_FILE" --no-recursive "${store_paths[@]}"
+    nix_cmd copy \
+      --to "file://$SCRATCH_DIR?secret-key=$(realpath "$SECRET_KEY_FILE")" \
+      --no-recursive \
+      "${store_paths[@]}"
 fi
 
-# (3) Delete the narinfos that were already present before the copy: they belong
-#     to cache.nixos.org or are already on the remote, so they must not be pushed.
+# Delete the narinfos which were present before `nix copy` was run
 if [[ ${#existing_narinfos[@]} -gt 0 ]]; then
-    rm -f "${existing_narinfos[@]}"
+    rm "${existing_narinfos[@]}"
 fi
 
 # Push back the newly created files, in 2 phases:
@@ -119,5 +92,5 @@ fi
 # 2. Only the narinfos
 # This allows the data to be consistent mid-transfer, since narinfos are the
 # source of truth of the binary cache
-rsync -a --ignore-existing --exclude='*.narinfo' "$tmp/" "$remote/"
-rsync -a --ignore-existing --include='/*.narinfo' --exclude='*' "$tmp/" "$remote/"
+rsync -a --ignore-existing --exclude='*.narinfo' "$SCRATCH_DIR/" "$REMOTE/"
+rsync -a --ignore-existing --include='/*.narinfo' --exclude='*' "$SCRATCH_DIR/" "$REMOTE/"

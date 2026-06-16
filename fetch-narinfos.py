@@ -1,87 +1,67 @@
 #!/usr/bin/env python3
-"""Fetch .narinfo files from a Nix binary cache, in parallel, over HTTP/2.
 
-Reads Nix store paths (one per line) from the file given as the second CLI
-argument. For each path it tries to download ``<hash>.narinfo`` from the binary
-cache into the output directory (first CLI argument). Paths whose narinfo is
-already present (e.g. pulled from the remote) are left untouched.
-
-Every store path whose narinfo could NOT be obtained -- i.e. the cache does not
-serve it -- is printed to stdout; those are the paths the caller must copy
-itself. Warnings go to stderr.
-
-Downloads are capped at 8 concurrent requests (an asyncio semaphore) and
-multiplexed over a shared HTTP/2 connection via niquests.
-
-Usage:
-    fetch-narinfos.py <output-dir> <paths-file> [<cache-url>]
 """
+Given a list of store paths, try and fetch the relative `.narinfo` file from
+the supplied binary cache (by default `https://cache.nixos.org`) to the output
+directory. Any file that cannot be fetched is printed to stdout.
+This script leverages HTTP/2 multiplexing to be as efficient as possible when
+fetching a possibly large amount of store paths.
+"""
+
+import argparse
 import asyncio
-import os
-import sys
+from asyncio import Semaphore
+from pathlib import Path
 
-import niquests
-
-CONCURRENCY = 8
-DEFAULT_CACHE = "https://cache.nixos.org"
+from niquests import AsyncSession
 
 
 def hash_part(store_path: str) -> str:
-    """``/nix/store/<32-char-hash>-name`` -> ``<32-char-hash>``."""
-    return os.path.basename(store_path)[:32]
+    """/nix/store/<32-char-hash>-<name> -> <32-char-hash>"""
+    return Path(store_path).name[:32]
 
 
-async def fetch_one(session, sem, base_url, out_dir, store_path, missing):
-    h = hash_part(store_path)
-    target = os.path.join(out_dir, f"{h}.narinfo")
-    if os.path.exists(target):  # already pulled from the remote; nothing to do
-        return
+async def fetch_one(
+    session: AsyncSession, semaphore: Semaphore, base_url: str, out_dir: Path, store_path: str
+) -> str | None:
+    hash_ = hash_part(store_path)
+    target_file = out_dir / f"{hash_}.narinfo"
+    if target_file.exists():
+        return None
 
-    url = f"{base_url}/{h}.narinfo"
+    url = f"{base_url}/{hash_}.narinfo"
     try:
-        async with sem:
-            # In multiplexed mode get() returns a lazy response and gather()
-            # resolves it. Holding the semaphore across both caps the number of
-            # in-flight downloads to CONCURRENCY while they share (multiplex
-            # over) the same HTTP/2 connection.
+        async with semaphore:
             resp = await session.get(url)
             await session.gather(resp)
-    except Exception as exc:
-        print(f"warning: failed to fetch {url}: {exc}", file=sys.stderr)
-        missing.append(store_path)
-        return
+    except IOError:
+        return store_path
 
-    if resp.status_code == 200:
-        with open(target, "wb") as fh:
-            fh.write(resp.content)
-    else:
-        # 404 (not on the cache) or otherwise unavailable: the caller copies it.
-        if resp.status_code != 404:
-            print(f"warning: {url} -> HTTP {resp.status_code}", file=sys.stderr)
-        missing.append(store_path)
+    if resp.status_code != 200:
+        return store_path
+
+    with open(target_file, "wb") as f:
+        f.write(resp.content)
+    return None
 
 
 async def main():
-    if len(sys.argv) < 3:
-        sys.exit("usage: fetch-narinfos.py <output-dir> <paths-file> [<cache-url>]")
-    out_dir = sys.argv[1]
-    with open(sys.argv[2]) as fh:
-        store_paths = [line.strip() for line in fh if line.strip()]
-    base_url = (sys.argv[3] if len(sys.argv) > 3 else DEFAULT_CACHE).rstrip("/")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-u", "--url", default="https://cache.nixos.org", help="Upstream cache url")
+    parser.add_argument("output_dir", type=Path, help="Output dir")
+    parser.add_argument("paths_file")
+    args = parser.parse_args()
 
-    if not store_paths:
-        return
-
-    missing: list[str] = []
-    sem = asyncio.Semaphore(CONCURRENCY)
-    async with niquests.AsyncSession(multiplexed=True) as session:
-        await asyncio.gather(
-            *(fetch_one(session, sem, base_url, out_dir, p, missing) for p in store_paths)
+    store_paths = [line.strip() for line in Path(args.paths_file).read_text().splitlines()]
+    semaphore = asyncio.Semaphore(8)
+    async with AsyncSession(multiplexed=True) as session:
+        missing_elements = await asyncio.gather(
+            *(fetch_one(session, semaphore, args.url, args.output_dir, p) for p in store_paths)
         )
 
-    # The paths we could not fetch are the ones the caller still needs to copy.
-    if missing:
-        sys.stdout.write("\n".join(missing) + "\n")
+    for element in missing_elements:
+        if element is not None:
+            print(element)
 
 
 if __name__ == "__main__":
