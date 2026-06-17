@@ -55,9 +55,9 @@ def main():
     for store_path in store_paths:
         name = os.path.basename(store_path)
         derivation_info = store_info["info"][name]
-        hash_ = convert_hash(derivation_info["narHash"])
+        narinfo_path = output_dir / f"{name[:32]}.narinfo"
 
-        if (output_dir / f"{hash_}.narinfo").exists():
+        if narinfo_path.exists():
             continue
 
         nar_fd, temp_nar_name = mkstemp(dir=nar_dir)
@@ -73,14 +73,14 @@ def main():
 
         Path(temp_nar_name).rename(nar_dir / f"{compressed_hash}.nar.zst")
 
-        (output_dir / f"{name[:32]}.narinfo").write_text(
+        narinfo_path.write_text(
             f"""
 StorePath: {store_path}
 URL: nar/{compressed_hash}.nar.zst
 Compression: zstd
 FileHash: sha256:{compressed_hash}
 FileSize: {compressed_size}
-NarHash: sha256:{hash_}
+NarHash: sha256:{convert_hash(derivation_info["narHash"])}
 NarSize: {derivation_info["narSize"]}
 References: {" ".join(derivation_info["references"])}
 Deriver: {derivation_info["deriver"]}
@@ -88,7 +88,7 @@ Sig: {" ".join(derivation_info["signatures"])}
 """.strip() + "\n"
         )
 
-    (output_dir / "nix-cache-info").write_text(f"StoreDir: {store_info["storeDir"]}")
+    (output_dir / "nix-cache-info").write_text(f"StoreDir: {store_info["storeDir"]}\n")
 
 
 if __name__ == "__main__":
